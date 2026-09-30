@@ -21,7 +21,7 @@ There are three ways to communicate:
 
 # Importing
 
-```
+```python
 from EndpointScaffolding import Server, Client
 ```
 
@@ -29,7 +29,7 @@ The exceptions are also available from the same module: ActionAssignationError, 
 
 # Server
 
-```
+```python
 Server(host="localhost", port=8765)
 ```
 
@@ -37,13 +37,13 @@ Creates a server. It does not start listening until it is called.
 
 ## Running the server
 
-```
+```python
 await server()
 ```
 
 Starts listening and keeps serving until the task is cancelled. To run it in a script use:
 
-```
+```python
 asyncio.run(server())
 ```
 
@@ -51,7 +51,7 @@ asyncio.run(server())
 
 Decorator that registers an async function as the receptor of a message type.
 
-```
+```python
 @server.receptor("greet")
 async def on_greet (payload, connection_id):
     ...
@@ -66,7 +66,7 @@ async def on_greet (payload, connection_id):
 
 Decorator that registers an async function that runs before the receptor of the same type.
 
-```
+```python
 @server.middleware("greet")
 async def check_name (payload, connection_id):
     return payload, "name" in payload
@@ -96,7 +96,7 @@ Replies to a message that was received by a receptor or a middleware. It must be
 
 # Client
 
-```
+```python
 Client(host="localhost", port=8765)
 ```
 
@@ -106,14 +106,14 @@ Creates a client. It does not connect until it is called.
 
 There are two ways to connect. The first one is a context manager that closes the connection by itself:
 
-```
+```python
 async with Client("localhost", 8765) as client:
     ...
 ```
 
 The second one is manual:
 
-```
+```python
 await client()
 ...
 await client.close()
@@ -148,7 +148,7 @@ Replies to a message that the server sent with request. It must be called with t
 
 Server, in a file called server.py:
 
-```
+```python
 import asyncio
 from EndpointScaffolding import Server
 
@@ -170,7 +170,7 @@ asyncio.run(server())
 
 Client, in a file called client.py:
 
-```
+```python
 import asyncio
 from EndpointScaffolding import Client
 
@@ -197,7 +197,7 @@ Subclass Server or Client and register the methods as receptors in the construct
 
 Server, in a file called server.py:
 
-```
+```python
 import asyncio
 from EndpointScaffolding import Server
 
@@ -223,7 +223,7 @@ asyncio.run(GreeterServer()())
 
 Client, in a file called client.py:
 
-```
+```python
 import asyncio
 from EndpointScaffolding import Client
 
