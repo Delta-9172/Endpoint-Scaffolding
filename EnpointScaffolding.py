@@ -1,6 +1,7 @@
 from typing import Any, Dict, Tuple, Optional, Callable, Set
 from abc import ABC, abstractmethod
 import asyncio, websockets, json
+import random
 import inspect, secrets, string
 import logging
 import os, ssl
@@ -485,17 +486,40 @@ class Server(_Endpoint):
             await asyncio.Future()
 
 # Talks to a single server, so unlike Server it holds one connection and needs
-# no client id in its messaging methods.
+# no client id in its messaging methods. When the connection drops it can
+# reconnect on its own, so a restart of the server does not leave the client
+# permanently disconnected.
 class Client(_Endpoint):
 
     # The connection stays empty until the client is called, which lets the
-    # methods detect and report a client that is not connected.
-    def __init__ (self, host: str = "localhost", port: int = 8765):
+    # methods detect and report a client that is not connected. The retry delay
+    # grows exponentially up to a ceiling, so a server that is down is not
+    # flooded with attempts. A max_reconnect_attempts of None retries forever.
+    def __init__ (
+        self,
+        host: str = "localhost",
+        port: int = 8765,
+        reconnect: bool = True,
+        reconnect_delay: float = 1.0,
+        reconnect_max_delay: float = 30.0,
+        max_reconnect_attempts: Optional[int] = None,
+    ):
         super().__init__()
+        if reconnect_delay <= 0 or reconnect_max_delay < reconnect_delay:
+            raise ValueError("reconnection delays are invalid")
         self._host: str = host
         self._port: int = port
+        self._reconnect: bool = reconnect
+        self._reconnect_delay: float = reconnect_delay
+        self._reconnect_max_delay: float = reconnect_max_delay
+        self._max_reconnect_attempts: Optional[int] = max_reconnect_attempts
         self._server_connection: Optional[_Connection] = None
+        # This task owns the whole life of the client: it runs the receive loop
+        # and, when the loop ends, decides whether to reconnect.
         self._receive_task: Optional[asyncio.Task] = None
+        # Tells the supervisor that a drop was requested by close() and must
+        # not trigger a reconnection.
+        self._closing: bool = False
 
     # There is only one connection, so no collision check is needed.
     def _get_server_id (self) -> str:
@@ -503,7 +527,8 @@ class Client(_Endpoint):
         return "".join(secrets.SystemRandom().choices(characters, k=24))
 
     # Fails with a clear error instead of an AttributeError when the client has
-    # not connected yet.
+    # not connected yet. While a reconnection is in progress the connection is
+    # empty too, so callers fail fast instead of writing to a dead socket.
     async def send (self, message_type: str, payload: Dict[str, Any]) -> None:
         if self._server_connection is None:
             raise CommunicationError("client is not connected")
@@ -516,41 +541,114 @@ class Client(_Endpoint):
         return await self._server_connection.request(message_type, payload, timeout)
 
     # The payload must come from the current connection, so an answer can never
-    # be sent to a server that is no longer the active one.
+    # be sent to a server that is no longer the active one. After a reconnection
+    # this also rejects requests received on the previous connection.
     async def answer (self, payload, return_data: Dict[str, Any]) -> None:
         connection = getattr(payload, "_connection", None)
         if connection is None or connection is not self._server_connection:
             raise CommunicationError("message was not received on the current connection")
         await connection.answer(payload, return_data)
 
-    # The server is verified before the connection is used and the socket is
-    # closed on any failure (BaseException includes cancellation), so an
-    # untrusted server never receives a message.
-    async def __call__ (self) -> None:
+    # One connection attempt, shared by the first connection and every retry.
+    # Network level failures become CommunicationError so callers handle one
+    # exception type. The server is verified before the connection is used and
+    # the socket is closed on any failure (BaseException includes
+    # cancellation), so an untrusted server never receives a message.
+    async def _open_connection (self) -> _Connection:
         uri = f"wss://{self._host}:{self._port}"
-        websocket = await websockets.connect(uri, ssl=_SecurityManager.client_context())
+        try:
+            websocket = await websockets.connect(uri, ssl=_SecurityManager.client_context())
+        except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException) as e:
+            raise CommunicationError(f"could not connect to {uri}") from e
         try:
             _SecurityManager.verify_server(websocket, self._host, self._port)
         except BaseException:
             await websocket.close()
             raise
-        self._server_connection = _Connection(websocket, self._get_server_id())
-        self._receive_task = asyncio.create_task(
-            self._server_connection.receive_loop(self._receptors, self._middlewares)
-        )
+        return _Connection(websocket, self._get_server_id())
 
-    # The connection and task are detached first so calls made during the close
-    # already see a disconnected client. A CommunicationError from the receive
-    # loop is expected on close, so only other failures are logged.
+    # Retries until a connection is established, the attempts run out or the
+    # task is cancelled. Returns None when it gives up. The wait is randomised
+    # (jitter) so many clients that lost the same server do not all retry at
+    # the same instant. A SecurityError or FileError is never retried: a server
+    # whose identity changed must not be accepted by trying again.
+    async def _reconnect_with_backoff (self) -> Optional[_Connection]:
+        delay = self._reconnect_delay
+        attempt = 0
+        while self._max_reconnect_attempts is None or attempt < self._max_reconnect_attempts:
+            attempt += 1
+            await asyncio.sleep(random.uniform(delay / 2, delay))
+            if self._closing:
+                return None
+            try:
+                connection = await self._open_connection()
+            except CommunicationError as e:
+                _logger.warning(
+                    "reconnection attempt %d to %s:%d failed: %s",
+                    attempt, self._host, self._port, e,
+                )
+                delay = min(delay * 2, self._reconnect_max_delay)
+                continue
+            except (SecurityError, FileError):
+                _logger.error("reconnection aborted: server could not be trusted", exc_info=True)
+                return None
+            if self._closing:
+                # close() was called while connecting, so the new connection
+                # must not outlive it.
+                await connection.close()
+                return None
+            return connection
+        _logger.error("giving up reconnecting after %d attempts", attempt)
+        return None
+
+    # Runs a connection until it ends and then, if allowed, replaces it. The
+    # connection is detached in the finally block so the client reports itself
+    # as disconnected during the gap. A CommunicationError is the normal way a
+    # connection ends; any other failure is a bug and is left to propagate.
+    async def _supervise (self, connection: _Connection) -> None:
+        while True:
+            try:
+                await connection.receive_loop(self._receptors, self._middlewares)
+            except CommunicationError:
+                pass
+            finally:
+                if self._server_connection is connection:
+                    self._server_connection = None
+            if self._closing or not self._reconnect:
+                return
+            _logger.warning("connection to %s:%d lost, reconnecting", self._host, self._port)
+            connection = await self._reconnect_with_backoff()
+            if connection is None:
+                return
+            self._server_connection = connection
+            _logger.info("reconnected to %s:%d", self._host, self._port)
+
+    # The first connection is made here and not in the background, so a wrong
+    # host or an untrusted server fails right away in the caller instead of
+    # being retried silently. Only connections lost afterwards are retried.
+    async def __call__ (self) -> None:
+        if self._receive_task is not None and not self._receive_task.done():
+            raise CommunicationError("client is already running")
+        self._closing = False
+        connection = await self._open_connection()
+        self._server_connection = connection
+        self._receive_task = asyncio.create_task(self._supervise(connection))
+
+    # The flag is raised first so the supervisor never reconnects because of
+    # this close. The task is cancelled afterwards because it may be sleeping
+    # between attempts, when there is no connection to close. A CommunicationError
+    # from the receive loop is expected on close, so only other failures are
+    # logged.
     async def close (self) -> None:
+        self._closing = True
         connection, self._server_connection = self._server_connection, None
         task, self._receive_task = self._receive_task, None
-        if connection is None:
-            return
         try:
-            await connection.close()
+            if connection is not None:
+                await connection.close()
         finally:
             if task is not None:
+                task.cancel()
                 (result,) = await asyncio.gather(task, return_exceptions=True)
                 if isinstance(result, Exception) and not isinstance(result, CommunicationError):
                     _logger.error("receive loop failed", exc_info=result)
