@@ -1,7 +1,7 @@
 # Endpoint-Scaffolding
 Mini python frameworck builded on top of websockets to abstract most of the protocols behind classes like Client and Server
 
-# EndpointScaffolding
+# about EndpointScaffolding
 
 EndpointScaffolding is a small framework to exchange messages between a Server and one or more Clients over an encrypted websocket connection. Every message has a type (a string) and a payload (a dictionary). You declare what should happen when a message of a given type arrives, and the framework takes care of the rest.
 
