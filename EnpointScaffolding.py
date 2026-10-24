@@ -1,6 +1,8 @@
-from typing import Any, Dict, Tuple, Optional, Callable, Set
+from typing import Any, Dict, Tuple, Optional, Callable, Set, FrozenSet
 from abc import ABC, abstractmethod
-import asyncio, websockets, json
+from dataclasses import dataclass
+import asyncio, websockets, json, logging
+from logging.handlers import RotatingFileHandler
 import inspect, secrets, string, random, logging
 import hashlib, hmac, datetime, os, ssl
 from pathlib import Path
@@ -33,7 +35,7 @@ class _Connection:
     def __init__ (
         self,
         websocket,
-        id_: str,
+        id_: ConnectionData,
         on_error: Optional[Callable[[BaseException], None]] = None,
     ):
         self._id_ = id_
@@ -101,8 +103,7 @@ class _Connection:
         middleware = middlewares.get(message["type"])
         if middleware is None:
             return payload, True
-        hash_valid = hashlib.sha256(self._serialize(payload).encode()).hexdigest() == message["hash"]
-        return await middleware(payload, self._id_, hash_valid)
+        return await middleware(payload, self._id_)
     async def _dispatch (self, message, receptors, middlewares) -> None:
         request_id = message.get("id") if message.get("class") == "request" else None
         payload = _Incoming(message["payload"], self, request_id)
@@ -127,8 +128,7 @@ class _Connection:
             await self._shutdown()
     async def send (self, message_type: str, payload: Dict[str, Any]) -> None:
         try:
-            p_hash = hashlib.sha256(self._serialize(payload).encode()).hexdigest()
-            message = {"type": message_type, "payload": payload, "class": "", "hash": p_hash}
+            message = {"type": message_type, "payload": payload, "class": ""}
             await self._websocket.send(self._serialize(message))
         except websockets.exceptions.ConnectionClosed as e:
             raise CommunicationError("messaging was unsuccessful") from e
@@ -147,8 +147,7 @@ class _Connection:
         id_ = self._get_request_id()
         self._active_requests[id_] = asyncio.get_running_loop().create_future()
         try:
-            p_hash = hashlib.sha256(self._serialize(payload).encode()).hexdigest()
-            message = {"type": message_type, "payload": payload, "class": "request", "id": id_, "hash": p_hash}
+            message = {"type": message_type, "payload": payload, "class": "request", "id": id_}
             await self._websocket.send(self._serialize(message))
             return await asyncio.wait_for(self._active_requests[id_], timeout)
         except asyncio.TimeoutError as e:
@@ -163,8 +162,7 @@ class _Connection:
         if message._request_id is None:
             raise CommunicationError("message is not a request")
         try:
-            p_hash = hashlib.sha256(self._serialize(return_data).encode()).hexdigest()
-            response = {"type": "", "payload": return_data, "class": "request_answer", "id": message._request_id, "hash": p_hash}
+            response = {"type": "", "payload": return_data, "class": "request_answer", "id": message._request_id}
             await self._websocket.send(self._serialize(response))
         except websockets.exceptions.ConnectionClosed as e:
             raise CommunicationError("answering was unsuccessful") from e
@@ -202,10 +200,10 @@ class _Endpoint(ABC):
                 return False
         return True
     async def __call__ (self) -> None:
-        for key, func in self._receptors.items():
+        for key in self._receptors.keys():
             if key not in self._middlewares.keys():
                 raise ActionAssignationError(f"no middleware was asigned to {key}")
-        for key, func in self._middlewares.items():
+        for key in self._middlewares.keys():
             if key not in self._receptors.keys():
                 raise ActionAssignationError(f"no receptor was asigned to {key}")
     @abstractmethod
@@ -315,14 +313,47 @@ class _SecurityManager:
         elif not hmac.compare_digest(known, fingerprint):
             raise SecurityError(f"identity of server {key} changed")
 
+class _Loggs:
+    def __init__(self, name: str = "ws_server"):
+        self.logger = logging.getLogger(name)
+        self.logger.setLevel(logging.INFO)
+        if not self.logger.handlers:
+            file_handler = RotatingFileHandler(
+                "ws.server.log", 
+                maxBytes=5 * 1024 * 1024, 
+                backupCount=3,
+                encoding="utf-8"
+            )
+            formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+    def info(self, msg: str) -> None:
+        self.logger.info(msg)
+    def error(self, msg: str) -> None:
+        self.logger.error(msg)
+    def warning(self, msg: str) -> None:
+        self.logger.warning(msg)
+
+@dataclass(frozen=True)
+class ConnectionData:
+    connection_id: str
+    ip: Tuple[str, int]
+    @property
+    def host (self) -> str:
+        return self.ip[0]
+    @property
+    def port (self) -> int:
+        return self.ip[1]
+
 class Server(_Endpoint):
     def __init__ (self, host: str = "localhost", port: int = 8765):
         super().__init__()
         self._host: str = host
         self._port: int = port
-        self._clients: Dict[str, _Connection] = {}
+        self._clients: Dict[ConnectionData, _Connection] = {}
         self._on_loging: Optional[Callable] = None
         self._client_out: Optional[Callable] = None
+        self._loggs = _Loggs()
     def _get_client_id (self) -> str:
         characters = string.ascii_letters + string.digits
         while True:
@@ -349,17 +380,23 @@ class Server(_Endpoint):
         return wrapper
     async def _handle_client (self, websocket) -> None:
         id_ = self._get_client_id()
-        client = _Connection(websocket, id_)
-        self._clients[id_] = client
+        ip = websocket.remote_address[0]
+        connection = ConnectionData(id_, ip)
+        client = _Connection(websocket, connection)
+        self._clients[connection] = client
         if self._on_loging != None:
-            await self._on_loging(id_)
+            await self._on_loging(connection)
         try:
+            self._loggs.info(f"Client {ip} has connected")
             await client.receive_loop(self._receptors, self._middlewares)
         except CommunicationError:
             pass
+        except Exception as e:
+            self._loggs.error(e)
         finally:
-            await self._client_out(id_)
+            await self._client_out(connection)
             self._clients.pop(id_, None)
+            self._loggs.info(f"Client {ip} has desconnected")
     async def send (self, client_id: str, message_type: str, payload: Dict[str, Any]) -> None:
         await self._clients[client_id].send(message_type, payload)
     async def broadcast (self, message_type: str, payload: Dict[str, Any]) -> None:
@@ -379,7 +416,7 @@ class Server(_Endpoint):
             raise CommunicationError("message was not received by this endpoint")
         await connection.answer(payload, return_data)
     async def __call__ (self) -> None:
-        super().__call__()
+        await super().__call__()
         ssl_context = _SecurityManager.server_context()
         async with websockets.serve(self._handle_client, self._host, self._port, ssl=ssl_context):
             await asyncio.Future()
@@ -435,7 +472,8 @@ class Client(_Endpoint):
         except BaseException:
             await websocket.close()
             raise
-        return _Connection(websocket, self._get_server_id())
+        connection = ConnectionData(self._get_server_id(), websocket.remote_address[0])
+        return _Connection(websocket, connection)
     async def _reconnect_with_backoff (self) -> Optional[_Connection]:
         delay = self._reconnect_delay
         attempt = 0
@@ -480,7 +518,7 @@ class Client(_Endpoint):
             self._server_connection = connection
             _logger.info("reconnected to %s:%d", self._host, self._port)
     async def __call__ (self) -> None:
-        super().__call__()
+        await super().__call__()
         if self._receive_task is not None and not self._receive_task.done():
             raise CommunicationError("client is already running")
         self._closing = False
