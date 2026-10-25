@@ -1,7 +1,8 @@
 from typing import Any, Dict, Tuple, Optional, Callable, Set, FrozenSet
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-import asyncio, websockets, json, logging
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
+import asyncio, websockets, json
 from logging.handlers import RotatingFileHandler
 import inspect, secrets, string, random, logging
 import hashlib, hmac, datetime, os, ssl
@@ -31,26 +32,96 @@ class _Incoming(dict):
         self._connection = connection
         self._request_id = request_id
 
-class _Connection:
-    def __init__ (
-        self,
-        websocket,
-        id_: ConnectionData,
-        on_error: Optional[Callable[[BaseException], None]] = None,
-    ):
-        self._id_ = id_
+class _WSIO:
+    def __init__ (self, websocket):
         self._websocket = websocket
-        self._on_error = on_error
-        self._reception_strategies = {
-            "": self._dispatch_strategy,
-            "request": self._dispatch_strategy,
-            "request_answer": self._has_answer_strategy,
+    @staticmethod
+    def _serialize (message: Dict) -> str:
+        return json.dumps(message)
+    @staticmethod
+    def _deserialize (message: str) -> Dict:
+        return json.loads(message)
+    async def recive (self) -> Tuple[Optional[str], Dict, str, Optional[str]]:
+        try:
+            raw = await self._websocket.recv()
+        except websockets.exceptions.ConnectionClosed as e:
+            raise CommunicationError("reception was unsuccessful") from e
+        try:
+            message = self._deserialize(raw)
+            return message["type"], message["payload"], message["class"], message["request_id"]
+        except (ValueError, KeyError, TypeError, AttributeError) as e:
+                    raise CommunicationError("malformed message received") from e
+    async def send (
+            self,
+            payload: Dict,
+            message_class: str,
+            message_type: Optional[str],
+            request_id: Optional[str] = None
+        ) -> None:
+        message = {
+            "type": message_type,
+            "payload": payload,
+            "class": message_class,
+            "id": request_id
         }
+        try:
+            await self._websocket.send(self._serialize(message))
+        except websockets.exceptions.ConnectionClosed as e:
+            raise CommunicationError("messaging was unsuccessful") from e
+    async def close (self):
+        await self._websocket.close()
+
+class _ReceptorRunner:
+    @staticmethod
+    async def _run_middleware (
+        middlewares,
+        message_type: str,
+        payload: Dict,
+        conection_id: str
+    ) -> Tuple[Dict, bool]:
+        middleware = middlewares.get(message_type)
+        if middleware is None:
+            return payload, True
+        return await middleware(payload, conection_id)
+    @staticmethod
+    async def _run_receptor (
+        receptors,
+        message_type: str,
+        payload: Dict,
+        conection_id: str
+    ) -> None:
+        receptor = receptors.get(message_type)
+        if receptor is not None:
+            await receptor(payload, conection_id)
+    async def __call__ (
+        self,
+        receptors,
+        middlewares,
+        message_type: str,
+        payload: _Incoming,
+        conection_id: str
+    ):
+        connection = payload._connection
+        request_id = payload._request_id
+        payload, is_vlalid = await self._run_middleware(middlewares, message_type, payload, conection_id)
+        if not isinstance(payload, _Incoming):
+            payload = _Incoming(payload, connection, request_id)
+        if is_vlalid:
+            await self._run_receptor(receptors, message_type, payload, conection_id)
+
+class _RequestManager:
+    def __init__ (self, connection_data: ConnectionData, on_error: Optional[Callable[[BaseException], None]] = None):
         self._active_requests: Dict[str, asyncio.Future] = {}
         self._tasks: Set[asyncio.Task] = set()
-    def get_id (self) -> str:
-        return self._id_
-    def _spawn (self, coro) -> None:
+        self._on_error = on_error
+        self._connection_data = connection_data
+    def _get_request_id (self) -> str:
+        characters = string.ascii_letters + string.digits
+        while True:
+            id_ = "".join(secrets.SystemRandom().choices(characters, k=24))
+            if id_ not in self._active_requests:
+                return id_
+    def spawn (self, coro) -> None:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._task_done)
@@ -66,10 +137,10 @@ class _Connection:
         else:
             _logger.error(
                 "middleware or receptor failed on connection %s",
-                self._id_,
+                self._connection_data.ip,
                 exc_info=error,
             )
-    async def _shutdown (self) -> None:
+    async def shutdown (self) -> None:
         for future in list(self._active_requests.values()):
             if not future.done():
                 future.set_exception(CommunicationError("connection closed"))
@@ -78,96 +149,77 @@ class _Connection:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-    @staticmethod
-    def _serialize (message: Dict) -> str:
-        return json.dumps(message)
-    @staticmethod
-    def _deserialize (message: str) -> Dict:
-        return json.loads(message)
-    async def _receive (self, receptors, middlewares) -> None:
-        try:
-            raw = await self._websocket.recv()
-        except websockets.exceptions.ConnectionClosed as e:
-            raise CommunicationError("reception was unsuccessful") from e
-        try:
-            message = self._deserialize(raw)
-            message_class = message.get("class", "")
-            strategy = self._reception_strategies[message_class]
-            required_key = "id" if message_class == "request_answer" else "type"
-            if required_key not in message:
-                raise CommunicationError(required_key)
-        except (ValueError, KeyError, TypeError, AttributeError) as e:
-            raise CommunicationError("malformed message received") from e
-        await strategy(message, receptors, middlewares)
-    async def _run_middleware (self, message, payload, middlewares) -> Tuple[Dict, bool]:
-        middleware = middlewares.get(message["type"])
-        if middleware is None:
-            return payload, True
-        return await middleware(payload, self._id_)
-    async def _dispatch (self, message, receptors, middlewares) -> None:
-        request_id = message.get("id") if message.get("class") == "request" else None
-        payload = _Incoming(message["payload"], self, request_id)
-        payload, is_valid = await self._run_middleware(message, payload, middlewares)
-        if not is_valid:
-            return
-        payload = _Incoming(payload, self, request_id)
-        receptor = receptors.get(message["type"])
-        if receptor is not None:
-            await receptor(payload, self._id_)
-    async def _dispatch_strategy (self, message, receptors, middlewares) -> None:
-        self._spawn(self._dispatch(message, receptors, middlewares))
-    async def _has_answer_strategy (self, message, receptors, middlewares) -> None:
-        future = self._active_requests.get(message["id"])
+    def add_request (self) -> str:
+        request_id = self._get_request_id()
+        self._active_requests[request_id] = asyncio.get_running_loop().create_future()
+        return request_id
+    async def wait_for (self, request_id: str, timeout: float = 30.0):
+        return await asyncio.wait_for(self._active_requests[request_id], timeout)
+    async def answer_request (self, request_id: str, message) -> None:
+        future = self._active_requests.get(request_id)
         if future is not None and not future.done():
             future.set_result(message)
-    async def receive_loop (self, receptors, middlewares) -> None:
-        try:
-            while True:
-                await self._receive(receptors, middlewares)
-        finally:
-            await self._shutdown()
-    async def send (self, message_type: str, payload: Dict[str, Any]) -> None:
-        try:
-            message = {"type": message_type, "payload": payload, "class": ""}
-            await self._websocket.send(self._serialize(message))
-        except websockets.exceptions.ConnectionClosed as e:
-            raise CommunicationError("messaging was unsuccessful") from e
-    def _get_request_id (self) -> str:
-        characters = string.ascii_letters + string.digits
-        while True:
-            id_ = "".join(secrets.SystemRandom().choices(characters, k=24))
-            if id_ not in self._active_requests:
-                return id_
-    async def request (
+
+class _Connection:
+    def __init__ (
         self,
-        message_type: str,
-        payload: Dict[str, Any],
-        timeout: float = 30.0,
-    ) -> Dict[str, Any]:
-        id_ = self._get_request_id()
-        self._active_requests[id_] = asyncio.get_running_loop().create_future()
+        websocket,
+        conection_data: ConnectionData,
+        on_error: Optional[Callable[[BaseException], None]] = None,
+    ):
+        self._io = _WSIO(websocket)
+        self._conection_data = conection_data
+        self._request_manager = _RequestManager(conection_data, on_error)
+        self._msg_class_strat = {
+            "send": self._dispatch_strat,
+            "request": self._dispatch_strat,
+            "answer": self._answer_strat
+        }
+    async def close (self):
+        await self._io.close()
+    async def send (self, message_type: str, payload: Dict[str, Any]) -> None:
+        await self._io.send(payload, "send", message_type)
+    async def request (self, message_type: str, payload: Dict[str, Any], timeout: float = 30.0) -> Dict:
+        request_id: str = self._request_manager.add_request()
+        await self._io.send(payload, "request", message_type, request_id)
         try:
-            message = {"type": message_type, "payload": payload, "class": "request", "id": id_}
-            await self._websocket.send(self._serialize(message))
-            return await asyncio.wait_for(self._active_requests[id_], timeout)
+            return await self._request_manager.wait_for(request_id, timeout)
         except asyncio.TimeoutError as e:
             raise CommunicationError("request timed out") from e
-        except websockets.exceptions.ConnectionClosed as e:
-            raise CommunicationError("requesting was unsuccessful") from e
-        finally:
-            self._active_requests.pop(id_, None)
     async def answer (self, message, return_data: Dict[str, Any]) -> None:
         if not isinstance(message, _Incoming) or message._connection is not self:
             raise CommunicationError("message does not belong to this connection")
         if message._request_id is None:
             raise CommunicationError("message is not a request")
+        await self._io.send(return_data, "answer", None, message._request_id)
+    async def receive_loop (self, receptors, middlewares) -> None:
         try:
-            response = {"type": "", "payload": return_data, "class": "request_answer", "id": message._request_id}
-            await self._websocket.send(self._serialize(response))
-        except websockets.exceptions.ConnectionClosed as e:
-            raise CommunicationError("answering was unsuccessful") from e
-    async def close (self) -> None:
-        await self._websocket.close()
+            while True:
+                await self._receive(receptors, middlewares)
+        finally:
+            await self._request_manager.shutdown()
+    async def _receive (self, receptors, middlewares) -> None:
+        msg_type, payload, msg_class, msg_request_id = await self._io.recive()
+        await self._msg_class_strat[msg_class](
+            receptors,
+            middlewares,
+            msg_type,
+            payload,
+            msg_request_id
+        )
+    async def _dispatch_strat (self, receptors, middlewares, msg_type: str, payload: Dict, msg_request_id: str) -> None:
+        self._request_manager.spawn(self._dispatch(
+            receptors,
+            middlewares,
+            msg_type,
+            payload,
+            msg_request_id
+        ))
+    async def _dispatch (self, receptors, middlewares, msg_type: str, payload: Dict, msg_request_id: str) -> None:
+        payload = _Incoming(payload, self, msg_request_id)
+        await _ReceptorRunner()(receptors, middlewares, msg_type, payload, self._conection_data)
+    async def _answer_strat (self, receptors, middlewares, msg_type: str, payload: Dict, msg_request_id: str) -> None:
+        await self._request_manager.answer_request(msg_request_id, _Incoming(payload, self, msg_request_id))
 
 class _Endpoint(ABC):
     def __init__ (self):
@@ -395,33 +447,41 @@ class Server(_Endpoint):
             self._loggs.error(e)
         finally:
             await self._client_out(connection)
-            self._clients.pop(id_, None)
+            self._clients.pop(connection, None)
             self._loggs.info(f"Client {ip} has desconnected")
-    async def send (self, client_id: str, message_type: str, payload: Dict[str, Any]) -> None:
-        await self._clients[client_id].send(message_type, payload)
+    async def send (self, client_data: ConnectionData, message_type: str, payload: Dict[str, Any]) -> None:
+        await self._clients[client_data].send(message_type, payload)
     async def broadcast (self, message_type: str, payload: Dict[str, Any]) -> None:
-        for id_ in list(self._clients.keys()):
-            await self.send(id_, message_type, payload)
+        for data in list(self._clients.keys()):
+            await self.send(data, message_type, payload)
     async def request (
         self,
-        client_id: str,
+        client_data: ConnectionData,
         message_type: str,
         payload: Dict[str, Any],
         timeout: float = 30.0,
     ) -> Dict[str, Any]:
-        return await self._clients[client_id].request(message_type, payload, timeout)
+        return await self._clients[client_data].request(message_type, payload, timeout)
     async def answer (self, payload, return_data: Dict[str, Any]) -> None:
-        connection = getattr(payload, "_connection", None)
+        connection: _Connection = getattr(payload, "_connection", None)
         if connection is None:
             raise CommunicationError("message was not received by this endpoint")
         await connection.answer(payload, return_data)
     async def __call__ (self) -> None:
+        if self._on_loging == None:
+            raise ActionAssignationError ("on_new_client hasn't been declared")
+        if self._client_out == None:
+            raise ActionAssignationError ("on_client_out hasn't been declared")
         await super().__call__()
         ssl_context = _SecurityManager.server_context()
-        async with websockets.serve(self._handle_client, self._host, self._port, ssl=ssl_context):
+        async with websockets.serve(
+            self._handle_client,
+            self._host,
+            self._port,
+            ssl=ssl_context,
+            max_size= 1 * 1024 * 1024
+        ):
             await asyncio.Future()
-    def get_clients (self) -> Tuple[str]:
-        return (client.get_id() for client in self._clients.values())
 
 class Client(_Endpoint):
     def __init__ (
